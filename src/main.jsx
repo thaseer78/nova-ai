@@ -36,10 +36,10 @@ import VoiceAssistant from "./VoiceAssistant";
 
 
 
-const DEFAULT_API_URL = "http://127.0.0.1:8000";
+const DEFAULT_API_URL =
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
 const DEFAULT_MODEL = "llama3.2";
-
 
 
 function App() {
