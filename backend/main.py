@@ -9,9 +9,12 @@ from pathlib import Path
 from urllib.parse import quote_plus, urlparse
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
+from starlette.responses import JSONResponse
+from collections import defaultdict, deque
+from time import monotonic
 import difflib
 
 
@@ -22,46 +25,110 @@ import difflib
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+DATABASE_PATH = Path(
+    os.getenv("DATABASE_PATH", str(BASE_DIR / "nova_memory.db"))
+)
+
+if not DATABASE_PATH.is_absolute():
+    DATABASE_PATH = BASE_DIR / DATABASE_PATH
+
 APP_NAME = "NOVA AI"
-OLLAMA_BASE_URL = os.getenv(
-    "OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"
-)
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
-DATABASE_PATH = BASE_DIR / "nova_memory.db"
+NOVA_MODE = os.getenv("NOVA_MODE", "local").strip().lower()
+AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama").strip().lower()
 
-client = OpenAI(
-    base_url=OLLAMA_BASE_URL,
-    api_key="ollama",
-    timeout=180.0,
-)
-
+if AI_PROVIDER == "groq":
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_api_key:
+        raise RuntimeError(
+            "AI_PROVIDER is 'groq' but GROQ_API_KEY is not configured. "
+            "Set it in the server environment; never put it in frontend code."
+        )
+    client = OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=groq_api_key,
+        timeout=180.0,
+    )
+    AI_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+elif AI_PROVIDER == "ollama":
+    OLLAMA_BASE_URL = os.getenv(
+        "OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1"
+    )
+    client = OpenAI(
+        base_url=OLLAMA_BASE_URL,
+        api_key="ollama",
+        timeout=180.0,
+    )
+    AI_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+else:
+    raise RuntimeError(
+        f"Unsupported AI_PROVIDER '{AI_PROVIDER}'. Use 'ollama' or 'groq'."
+    )
 app = FastAPI(title="NOVA AI API", version="2.0.0")
+
+_default_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+_configured_origins = [
+    origin.strip().rstrip("/")
+    for origin in (os.getenv("FRONTEND_ORIGINS", "") + "," + os.getenv("FRONTEND_ORIGIN", "")).split(",")
+    if origin.strip()
+]
+_allowed_origins = list(dict.fromkeys(_default_origins + _configured_origins))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
+# Hosted portfolio safety: never expose local Windows-control or direct
+# memory/history management endpoints to the public internet. Chat can still
+# use the internal memory functions. CORS is not authentication, so apply a
+# modest per-IP request limit to the public chat endpoint as well.
+_chat_requests = defaultdict(deque)
+_CHAT_LIMIT = int(os.getenv("CHAT_REQUESTS_PER_MINUTE", "20"))
+_CHAT_WINDOW_SECONDS = 60
+
+@app.middleware("http")
+async def hosted_safety_middleware(request: Request, call_next):
+    path = request.url.path
+
+    if NOVA_MODE == "hosted":
+        if path.startswith("/api/pc/") or path.startswith("/api/memories") or path.startswith("/api/history"):
+            return JSONResponse(
+                status_code=403,
+                content={"detail": "This endpoint is disabled in hosted mode."},
+            )
+
+        if path == "/v1/chat/completions" and request.method == "POST":
+            client_ip = request.client.host if request.client else "unknown"
+            now = monotonic()
+            recent = _chat_requests[client_ip]
+            while recent and now - recent[0] >= _CHAT_WINDOW_SECONDS:
+                recent.popleft()
+            if len(recent) >= _CHAT_LIMIT:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Chat rate limit reached. Please wait a minute and try again."},
+                )
+            recent.append(now)
+
+    return await call_next(request)
+
 SYSTEM_PROMPT = """
-You are NOVA, a helpful personal AI assistant running locally.
+You are NOVA, a helpful personal AI assistant.
 Be conversational, practical, and accurate.
 Use saved memories when relevant.
 Never claim that you performed a computer action unless it succeeded.
-You cannot directly control the computer through chat.
 Computer actions require a separate approved backend action.
 Keep replies concise unless the user asks for detail.
-You are NOVA, a personal AI assistant running locally.
-Your configured AI model is Ollama running llama3.2.
-When asked which model powers you, identify it as Llama 3.2
-running through Ollama. Never invent model architectures.
+When asked which model or provider is running, identify the configured provider
+and model accurately. Never invent model architectures or capabilities.
 """
 
 # ============================================================
@@ -316,7 +383,7 @@ def save_message(session_id, role, content):
             "role": role,
             "content": content,
             "created_at": datetime.now().isoformat(timespec="seconds"),
-            "model": OLLAMA_MODEL,
+            "model": AI_MODEL,
         }
 
         insert_columns = [
@@ -370,25 +437,27 @@ def root():
     return {
         "name": APP_NAME,
         "status": "running",
-        "model": OLLAMA_MODEL,
+        "model": AI_MODEL,
     }
 
 
 @app.get("/health")
 def health():
     try:
+        # A lightweight provider check; never return secrets from this endpoint.
         models = client.models.list()
         return {
             "status": "healthy",
-            "ollama": "connected",
-            "configured_model": OLLAMA_MODEL,
+            "provider": AI_PROVIDER,
+            "configured_model": AI_MODEL,
             "available_models": [model.id for model in models.data],
         }
-    except Exception as exc:
+    except Exception:
         return {
             "status": "degraded",
-            "ollama": "disconnected",
-            "error": str(exc),
+            "provider": AI_PROVIDER,
+            "configured_model": AI_MODEL,
+            "message": "The configured AI provider could not be reached.",
         }
 
 
@@ -721,7 +790,7 @@ def chat_completions(payload: dict = Body(...)):
 
     try:
         response = client.chat.completions.create(
-            model=OLLAMA_MODEL,
+            model=AI_MODEL,
             messages=messages,
             temperature=0.7,
         )
@@ -739,7 +808,7 @@ def chat_completions(payload: dict = Body(...)):
             "id": "nova-" + str(int(datetime.now().timestamp() * 1000)),
             "object": "chat.completion",
             "created": int(datetime.now().timestamp()),
-            "model": OLLAMA_MODEL,
+            "model": AI_MODEL,
             "choices": [{
                 "index": 0,
                 "message": {
@@ -757,8 +826,8 @@ def chat_completions(payload: dict = Body(...)):
         raise HTTPException(
             status_code=502,
             detail=(
-                "NOVA could not generate a response. Make sure Ollama is "
-                "running and llama3.2 is installed. Error: " + str(exc)
+                "NOVA could not generate a response from the configured AI "
+                "provider. Check the backend logs and provider configuration."
             ),
         )
 
